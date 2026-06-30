@@ -1,42 +1,160 @@
 /**
- * 一致性锚 (Consistency Anchor) v1.0.2
- * 修复：确保 UI 显示，兼容更广的 ST 版本
+ * 一致性锚 (Consistency Anchor) - 完美开源发版 (Open Source Ready)
+ * 包含：模块化 UI 管理、事件降级兼容、UI 懒加载缓存、超时防死循环保护、精准防误触、ST 1.13+ 多路径兼容
  */
 
-(async function () {
-    // 等待依赖就绪
-    const { extension_settings, saveSettingsDebounced } = window;
-    const { eventSource, event_types } = window;
+const extensionName = "consistency-anchor";
+const MAX_RETRIES = 40; // 40次 * 500ms = 20秒超时
+let initRetries = 0;
+let stContext = null;
+let extensionPath = '';
 
-    if (!extension_settings || !eventSource) {
-        console.warn('[一致性锚] SillyTavern API 尚未就绪，500ms 后重试');
-        return setTimeout(arguments.callee, 500);
+// =========================================================================
+// 兼容层：SillyTavern 事件名称降级映射 (适配新老版本 ST)
+// =========================================================================
+const ST_EVENTS = {
+    get CHAT_CHANGED() { 
+        return window.event_types?.CHAT_CHANGED 
+            || window.EVENT_CHAT_CHANGED 
+            || 'chat_changed'; 
+    },
+    get GENERATE_BEFORE() { 
+        return window.event_types?.GENERATE_BEFORE 
+            || window.event_types?.TEXT_COMPLETION_BEFORE 
+            || window.EVENT_GENERATE_BEFORE 
+            || 'text_completion_before'; 
+    },
+    get MESSAGE_RECEIVED() { 
+        return window.event_types?.MESSAGE_RECEIVED 
+            || window.EVENT_MESSAGE_RECEIVED 
+            || 'message_received'; 
     }
+};
 
-    // ---------- 工具函数 ----------
-    function jaccardSimilarity(str1, str2) {
-        const bigrams = s => {
-            const set = new Set();
-            for (let i = 0; i < s.length - 1; i++) set.add(s.substring(i, i + 2));
-            return set;
-        };
-        const a = bigrams(str1), b = bigrams(str2);
-        if (!a.size && !b.size) return 1;
-        const inter = new Set([...a].filter(x => b.has(x)));
-        const union = new Set([...a, ...b]);
-        return inter.size / union.size;
-    }
+// =========================================================================
+// 核心业务逻辑 (Model & Controller)
+// =========================================================================
+window.ConsistencyAnchor = {
+    settings: {},
+    defaultSettings: {
+        enabled: true,
+        anchorFrequency: 3,
+        memoryPoolMaxTokens: 200,
+        repetitionCheckCount: 3,
+        repetitionThreshold: 0.7,
+        formatAutoFix: true,
+        strictFormatCheck: true,
+        thoughtLeakIntercept: true,
+        debugMode: false,
+        showFloatingBtn: true,
+        btnPosLeft: '',
+        btnPosTop: ''
+    },
+    cachedNorms: null,
+    cachedCharacterId: null,
+    aiReplyCache: [],
+    messageCounter: 0,
+    lastInjectionRound: -1,
+    highPriorityMemories: '',
+    leakDetected: false,
+    _initialized: false,
+    _destroyed: false,
 
-    function parseCharacterNorms(desc = '') {
-        const norms = {
-            person: '第三人称',
-            dialogueWrap: '"',
-            actionWrap: '*',
-            innerThoughtWrap: ''
-        };
+    _boundOnChatChanged: null,
+    _boundOnGenerateBefore: null,
+    _boundOnMessageReceived: null,
+
+    // ---- 初始化 ----
+    init: async function() {
+        if (this._destroyed) {
+            console.warn('[ConsistencyAnchor] 已销毁，无法重新初始化');
+            return;
+        }
+        const ctx = window.SillyTavern?.getContext?.();
+        if (!ctx) return;
+        stContext = ctx;
+
+        // 加载设置
+        if (ctx.extensionSettings[extensionName]) {
+            this.settings = { ...this.defaultSettings, ...ctx.extensionSettings[extensionName] };
+        } else {
+            this.settings = { ...this.defaultSettings };
+            ctx.extensionSettings[extensionName] = this.settings;
+            if (typeof ctx.saveSettingsDebounced === 'function') {
+                ctx.saveSettingsDebounced();
+            } else if (typeof ctx.saveSettings === 'function') {
+                ctx.saveSettings();
+            }
+        }
+
+        if (!this.settings.enabled) {
+            if (this.settings.debugMode) console.log('[ConsistencyAnchor] 插件已禁用');
+            return;
+        }
+
+        // 解绑旧事件
+        this.destroy();
+        this._destroyed = false;
+
+        // 安全绑定事件（兼容新旧版本）
+        if (window.eventSource) {
+            this._boundOnChatChanged = this.onChatChanged.bind(this);
+            this._boundOnGenerateBefore = this.onGenerateBefore.bind(this);
+            this._boundOnMessageReceived = this.onMessageReceived.bind(this);
+            window.eventSource.on(ST_EVENTS.CHAT_CHANGED, this._boundOnChatChanged);
+            window.eventSource.on(ST_EVENTS.GENERATE_BEFORE, this._boundOnGenerateBefore);
+            window.eventSource.on(ST_EVENTS.MESSAGE_RECEIVED, this._boundOnMessageReceived);
+        }
+
+        await this.refreshCharacterNorms();
+        await this.refreshHighPriorityMemories();
+        this._initialized = true;
+        if (this.settings.debugMode) console.log('[ConsistencyAnchor] 初始化完成');
+    },
+
+    // ---- 销毁/解绑 ----
+    destroy: function() {
+        if (this._destroyed) return;
+        if (window.eventSource) {
+            if (this._boundOnChatChanged) {
+                window.eventSource.off(ST_EVENTS.CHAT_CHANGED, this._boundOnChatChanged);
+                this._boundOnChatChanged = null;
+            }
+            if (this._boundOnGenerateBefore) {
+                window.eventSource.off(ST_EVENTS.GENERATE_BEFORE, this._boundOnGenerateBefore);
+                this._boundOnGenerateBefore = null;
+            }
+            if (this._boundOnMessageReceived) {
+                window.eventSource.off(ST_EVENTS.MESSAGE_RECEIVED, this._boundOnMessageReceived);
+                this._boundOnMessageReceived = null;
+            }
+        }
+        this._initialized = false;
+        this._destroyed = true;
+    },
+
+    // ---- 规范解析 ----
+    refreshCharacterNorms: async function() {
+        try {
+            const ctx = stContext || window.SillyTavern?.getContext?.();
+            const charId = ctx?.characterId || 'default';
+            if (this.cachedCharacterId === charId && this.cachedNorms) return;
+            const char = ctx?.characters?.[charId];
+            const desc = char?.data?.description || char?.description || '';
+            this.cachedNorms = this.parseCharacterNorms(desc);
+            this.cachedCharacterId = charId;
+        } catch (e) {
+            console.warn('[ConsistencyAnchor] 解析角色规范失败，使用默认值', e);
+            this.cachedNorms = { person: '第三人称', dialogueWrap: '"', actionWrap: '*', innerThoughtWrap: '' };
+        }
+    },
+
+    parseCharacterNorms: function(desc) {
+        if (!desc) desc = '';
+        const norms = { person: '第三人称', dialogueWrap: '"', actionWrap: '*', innerThoughtWrap: '' };
         if (/我(的|是|想|觉得|知道|去|来|可以|需要)/.test(desc)) norms.person = '第一人称';
-        else if (/(他|她|它)(的|是|想|觉得|知道|去|来)/.test(desc)) norms.person = '第三人称';
         else if (/(你)(的|是|想|觉得|知道|去|来)/.test(desc)) norms.person = '第二人称';
+        else if (/(他|她|它)(的|是|想|觉得|知道|去|来)/.test(desc)) norms.person = '第三人称';
         if (/\*[^*]+\*/.test(desc)) norms.actionWrap = '*';
         if (/“[^”]+”/.test(desc)) norms.dialogueWrap = '“';
         else if (/"[^"]+"/.test(desc)) norms.dialogueWrap = '"';
@@ -44,247 +162,558 @@
         else if (/（[^）]+）/.test(desc)) norms.innerThoughtWrap = '（）';
         else if (/『[^』]+』/.test(desc)) norms.innerThoughtWrap = '『』';
         return norms;
-    }
+    },
 
-    // ---------- 主扩展类 ----------
-    class ConsistencyAnchor {
-        constructor() {
-            this.settings = {
-                enabled: true,
-                anchorFrequency: 3,
-                memoryPoolMaxTokens: 200,
-                repetitionCheckCount: 5,
-                repetitionThreshold: 0.7,
-                formatAutoFix: true,
-                strictFormatCheck: true,
-                thoughtLeakIntercept: true,
-                debugMode: false
-            };
-            this.cachedNorms = null;
-            this.aiReplyCache = [];
-            this.messageCounter = 0;
-            this.lastInjectionRound = -1;
-            this.highPriorityEntries = [];
-            this.repetitionTriggered = false;
-            this.leakDetectedLastRound = false;
+    // ---- 记忆池解析 ----
+    refreshHighPriorityMemories: async function() {
+        try {
+            const ctx = stContext || window.SillyTavern?.getContext?.();
+            const worldInfo = ctx?.worldInfo || window.worldInfo;
+            let entries = [];
+            if (worldInfo && typeof worldInfo.getEntries === 'function') entries = worldInfo.getEntries();
+            else entries = window.worldInfo?.entries || [];
+            this.highPriorityMemories = this.extractHighPriority(entries, this.settings.memoryPoolMaxTokens);
+        } catch (e) {
+            console.warn('[ConsistencyAnchor] 加载记忆池失败', e);
+            this.highPriorityMemories = '';
         }
+    },
 
-        async init() {
-            const ctx = window.SillyTavern.getContext();
-            if (ctx.extensionSettings['consistency-anchor']) {
-                Object.assign(this.settings, ctx.extensionSettings['consistency-anchor']);
-            } else {
-                ctx.extensionSettings['consistency-anchor'] = this.settings;
-                saveSettingsDebounced();
+    extractHighPriority: function(entries, maxTokens) {
+        if (!Array.isArray(entries)) return '';
+        const high = entries.filter(e => e.priority === 'high' || e.key?.startsWith('!'));
+        if (!high.length) return '';
+        high.sort((a, b) => (b.priorityValue || 0) - (a.priorityValue || 0));
+        let combined = '', tokens = 0;
+        for (const e of high) {
+            const content = e.content || e.text || '';
+            const est = content.length * 0.6;
+            if (tokens + est > maxTokens) break;
+            combined += content + '\n';
+            tokens += est;
+        }
+        return combined.trim();
+    },
+
+    // ---- 生命周期监听 ----
+    onChatChanged: async function() {
+        this.messageCounter = 0;
+        this.lastInjectionRound = -1;
+        this.aiReplyCache = [];
+        this.leakDetected = false;
+        await this.refreshCharacterNorms();
+        await this.refreshHighPriorityMemories();
+    },
+
+    onGenerateBefore: async function(eventData) {
+        if (!this.settings.enabled) return;
+        if (!this.cachedNorms) await this.refreshCharacterNorms();
+        this.messageCounter++;
+
+        if ((this.messageCounter - this.lastInjectionRound) >= this.settings.anchorFrequency) {
+            this.lastInjectionRound = this.messageCounter;
+            this.injectConsistencyAnchor(eventData);
+        }
+        if (this.highPriorityMemories) this.injectMemoryPool(eventData);
+        if (this.settings.thoughtLeakIntercept) this.injectAntiLeakDirective(eventData);
+    },
+
+    safeInject: function(text, eventData, position = 'before') {
+        try {
+            const ctx = stContext || window.SillyTavern?.getContext?.();
+            if (ctx && typeof ctx.injectPrompt === 'function') {
+                ctx.injectPrompt(text, position);
+                return true;
             }
-
-            if (!this.settings.enabled) return;
-
-            eventSource.on(event_types.CHAT_CHANGED, this.onChatChanged.bind(this));
-            eventSource.on(event_types.GENERATE_BEFORE, this.onGenerateBefore.bind(this));
-            eventSource.on(event_types.GENERATE_AFTER, this.onGenerateAfter.bind(this));
-            eventSource.on('message_received', this.onMessageReceived.bind(this));
-
-            this.log('已初始化');
-        }
-
-        toggleEnabled(state) {
-            this.settings.enabled = state;
-            if (state) {
-                eventSource.on(event_types.CHAT_CHANGED, this.onChatChanged.bind(this));
-                eventSource.on(event_types.GENERATE_BEFORE, this.onGenerateBefore.bind(this));
-                eventSource.on(event_types.GENERATE_AFTER, this.onGenerateAfter.bind(this));
-                eventSource.on('message_received', this.onMessageReceived.bind(this));
-            } else {
-                eventSource.off(event_types.CHAT_CHANGED, this.onChatChanged);
-                eventSource.off(event_types.GENERATE_BEFORE, this.onGenerateBefore);
-                eventSource.off(event_types.GENERATE_AFTER, this.onGenerateAfter);
-                eventSource.off('message_received', this.onMessageReceived);
+            if (eventData && typeof eventData.prompt === 'string') {
+                eventData.prompt = position === 'before' 
+                    ? (text + '\n' + eventData.prompt) 
+                    : (eventData.prompt + '\n' + text);
+                return true;
             }
-            saveSettingsDebounced();
+        } catch (e) {
+            if (this.settings?.debugMode) console.warn('[ConsistencyAnchor] 注入失败', e);
         }
+        return false;
+    },
 
-        onChatChanged() {
-            this.cachedNorms = null;
-            this.aiReplyCache = [];
-            this.messageCounter = 0;
-            this.lastInjectionRound = -1;
-            this.leakDetectedLastRound = false;
+    injectConsistencyAnchor: function(eventData) {
+        const norms = this.cachedNorms;
+        if (!norms) return;
+        let anchor = `[SYSTEM_ANCHOR: 当前角色为「${norms.person}」人称。对话用${norms.dialogueWrap}，动作用${norms.actionWrap}。`;
+        if (norms.innerThoughtWrap) anchor += `内心独白用${norms.innerThoughtWrap}。`;
+        anchor += '严格遵循格式，禁止输出思考过程。]';
+        this.safeInject(anchor, eventData, 'after');
+    },
 
-            const ctx = window.SillyTavern.getContext();
-            const char = ctx.characters[ctx.characterId];
-            if (char) {
-                const desc = char.data?.description || char.description || '';
-                this.cachedNorms = parseCharacterNorms(desc);
-                this.log('角色规范已解析', this.cachedNorms);
+    injectMemoryPool: function(eventData) {
+        if (this.highPriorityMemories) this.safeInject(`[重要设定记忆]\n${this.highPriorityMemories}`, eventData, 'before');
+    },
+
+    injectAntiLeakDirective: function(eventData) {
+        this.safeInject('[系统指令: 严禁展示思考、推理、分析或内部决策，直接输出最终回答。]', eventData, 'before');
+    },
+
+    onMessageReceived: async function({ message }) {
+        if (!this.settings.enabled || !message) return;
+        const isUserMessage = message.is_user === true || message.role === 'user';
+        if (isUserMessage) return;
+        
+        const aiText = message.text || message.content || '';
+        if (!aiText || aiText.length < 5) return;
+
+        // 复读检测
+        if (this.aiReplyCache.length > 0) {
+            const lastReply = this.aiReplyCache[this.aiReplyCache.length - 1];
+            if (lastReply && lastReply.length > 10) {
+                const sim = this.fastJaccardSimilarity(aiText, lastReply);
+                if (sim > this.settings.repetitionThreshold) {
+                    this.leakDetected = true;
+                    if (this.settings.debugMode) console.warn(`[ConsistencyAnchor] 复读 (相似度: ${sim.toFixed(2)})`);
+                } else this.leakDetected = false;
             }
-            this.scanHighPriorityEntries();
         }
+        this.aiReplyCache.push(aiText);
+        if (this.aiReplyCache.length > this.settings.repetitionCheckCount) this.aiReplyCache.shift();
 
-        scanHighPriorityEntries() {
-            this.highPriorityEntries = [];
-            try {
-                const worldInfo = window.SillyTavern.getContext().worldInfo;
-                if (worldInfo?.entries) {
-                    for (const uid in worldInfo.entries) {
-                        const e = worldInfo.entries[uid];
-                        const isHigh = (e.priority && e.priority >= 100) ||
-                                       (e.comment && /!/.test(e.comment)) ||
-                                       (e.content && /^!/.test(e.content.trim()));
-                        if (isHigh) {
-                            this.highPriorityEntries.push({ keys: e.key, content: e.content });
+        // 格式修正
+        if (this.settings.formatAutoFix || this.settings.strictFormatCheck) {
+            const fixed = this.validateAndFixFormat(aiText);
+            if (fixed && fixed !== aiText && this.settings.formatAutoFix) {
+                const newMsg = { ...message, text: fixed, content: fixed };
+                try {
+                    const ctx = stContext || window.SillyTavern?.getContext?.();
+                    if (ctx && typeof ctx.updateMessage === 'function') {
+                        ctx.updateMessage(newMsg);
+                    } else {
+                        if (this.settings.debugMode) console.warn('[ConsistencyAnchor] 格式偏差已检测，请手动编辑:', fixed);
+                        if (!this._formatFixToastShown) {
+                            this._formatFixToastShown = true;
+                            this.showToast('格式检测到偏差，请双击消息手动修正', 'warning');
+                            setTimeout(() => { this._formatFixToastShown = false; }, 10000);
                         }
                     }
-                }
-                this.log(`高优先级条目 ${this.highPriorityEntries.length} 条`);
-            } catch (e) { this.warn(e); }
-        }
-
-        onGenerateBefore(event) {
-            if (!this.settings.enabled) return;
-            const payload = event.detail;
-            this.messageCounter++;
-
-            // 1. 锚点注入
-            if ((this.messageCounter - this.lastInjectionRound) >= this.settings.anchorFrequency && this.cachedNorms) {
-                this.inject(payload, this.buildAnchor(), 'system');
-                this.lastInjectionRound = this.messageCounter;
-            }
-
-            // 2. 记忆池注入
-            const entries = this.selectRelevantEntries();
-            if (entries.length) {
-                this.inject(payload, this.buildMemoryBlock(entries), 'system');
-            }
-
-            // 3. 反重复
-            if (this.repetitionTriggered) {
-                this.inject(payload, '\n[系统指令：严禁重复上一段回复的句式或词汇，请重新组织语言。]\n', 'system');
-                if (payload.repetition_penalty !== undefined) {
-                    payload.repetition_penalty = Math.min(payload.repetition_penalty + 0.1, 1.5);
-                }
-                this.repetitionTriggered = false;
-            }
-
-            // 4. 思维链防火墙
-            if (this.settings.thoughtLeakIntercept) {
-                this.inject(payload, '\n[绝对禁止输出“思考：”、“作为AI”、“内心想法：”等任何自我分析内容。]\n', 'system');
-                if (payload.stop) {
-                    const leakStops = ['思考：', '作为AI', '内心想法：', '（系统提示', '[分析'];
-                    payload.stop = [...new Set([...payload.stop, ...leakStops])];
-                }
-            }
-            if (this.leakDetectedLastRound) {
-                this.inject(payload, '\n[紧急：上次回复泄露了思考内容，本次必须严格避免。]\n', 'system');
-                this.leakDetectedLastRound = false;
-            }
-        }
-
-        buildAnchor() {
-            const n = this.cachedNorms;
-            let block = `[SYSTEM_ANCHOR: 叙述使用${n.person}，对话用${n.dialogueWrap}包裹，动作用${n.actionWrap}包裹。`;
-            if (n.innerThoughtWrap) block += ` 内心独白用${n.innerThoughtWrap}包裹。`;
-            block += ' 请严格遵循。]';
-            return block;
-        }
-
-        buildMemoryBlock(entries) {
-            let block = '[关联设定记忆]\n';
-            const maxChars = this.settings.memoryPoolMaxTokens * 3.5;
-            let total = 0;
-            for (const e of entries) {
-                const line = `- ${e.content}\n`;
-                if (total + line.length > maxChars) break;
-                block += line;
-                total += line.length;
-            }
-            return block;
-        }
-
-        selectRelevantEntries() {
-            if (!this.highPriorityEntries.length) return [];
-            const chat = window.SillyTavern.getContext().chat;
-            if (!chat?.length) return this.highPriorityEntries.slice(0, 3);
-            const recentText = chat.slice(-5).map(m => m.mes || '').join(' ');
-            return this.highPriorityEntries.filter(e => {
-                const keys = (e.keys || '').toLowerCase().split(',');
-                return keys.some(k => recentText.toLowerCase().includes(k.trim()));
-            });
-        }
-
-        inject(payload, text, role) {
-            if (Array.isArray(payload.messages)) {
-                payload.messages.splice(payload.messages.length - 1, 0, { role: 'system', content: text });
-            } else if (typeof payload.prompt === 'string') {
-                payload.prompt += '\n' + text;
-            }
-        }
-
-        onGenerateAfter(event) {
-            if (!this.settings.enabled) return;
-            const text = event.detail?.message;
-            if (!text) return;
-
-            this.detectRepetition(text);
-
-            if (this.settings.strictFormatCheck) {
-                const fixed = this.fixFormat(text);
-                if (fixed !== text) {
-                    event.detail.message = fixed;
-                    this.log('格式已自动修正');
-                }
-            }
-
-            if (this.settings.thoughtLeakIntercept && this.leakCheck(text)) {
-                event.detail.message = '';
-                this.leakDetectedLastRound = true;
-                this.log('思维链泄露已拦截');
-            }
-        }
-
-        onMessageReceived(event) {
-            const msg = event.detail?.message;
-            if (msg?.role === 'assistant') {
-                this.aiReplyCache.push(msg.content);
-                if (this.aiReplyCache.length > this.settings.repetitionCheckCount) {
-                    this.aiReplyCache.shift();
+                } catch (e) {
+                    console.warn('[ConsistencyAnchor] 无法更新消息内容', e);
                 }
             }
         }
 
-        detectRepetition(newText) {
-            for (const cached of this.aiReplyCache) {
-                if (jaccardSimilarity(newText, cached) >= this.settings.repetitionThreshold) {
-                    this.repetitionTriggered = true;
-                    this.log('重复度超标');
+        if (this.cachedNorms) this.checkPersonConsistency(aiText);
+
+        if (this.settings.thoughtLeakIntercept && this.detectThoughtLeak(aiText)) {
+            this.leakDetected = true;
+            this.showToast('检测到思维链泄露，建议重新生成。', 'warning');
+        }
+    },
+
+    fastJaccardSimilarity: function(str1, str2, sampleLen = 150) {
+        if (!str1 || !str2) return 0;
+        if (str1 === str2) return 1;
+        const sample = (s) => s.length <= sampleLen * 2 ? s : s.slice(0, sampleLen) + s.slice(-sampleLen);
+        const getBigrams = (s) => {
+            const set = new Set();
+            for (let i = 0; i < s.length - 1; i++) set.add(s[i] + s[i + 1]);
+            return set;
+        };
+        const a = getBigrams(sample(str1));
+        const b = getBigrams(sample(str2));
+        if (a.size === 0 && b.size === 0) return 1;
+        const smaller = a.size < b.size ? a : b;
+        const larger = a.size < b.size ? b : a;
+        let intersection = 0;
+        for (const item of smaller) { if (larger.has(item)) intersection++; }
+        return intersection / (a.size + b.size - intersection);
+    },
+
+    validateAndFixFormat: function(text) {
+        const norms = this.cachedNorms;
+        if (!norms) return null;
+        let fixed = text;
+        if (norms.dialogueWrap === '“') fixed = fixed.replace(/"([^"]*)"/g, '“$1”');
+        else if (norms.dialogueWrap === '"') fixed = fixed.replace(/“([^”]*)”/g, '"$1"');
+        if (norms.actionWrap === '*') fixed = fixed.replace(/\*\*([^*]+)\*\*/g, '*$1*');
+        return fixed !== text ? fixed : null;
+    },
+
+    checkPersonConsistency: function(text) {
+        const expected = this.cachedNorms?.person;
+        if (!expected) return;
+        let detected = '未知';
+        if (/我(的|是|想|觉得|知道)/.test(text)) detected = '第一人称';
+        else if (/你(的|是|想|觉得|知道)/.test(text)) detected = '第二人称';
+        else if (/(他|她|它)(的|是|想|觉得|知道)/.test(text)) detected = '第三人称';
+        if (detected !== '未知' && detected !== expected && this.settings.debugMode) {
+            console.warn(`[ConsistencyAnchor] 人称漂移警告: 期望[${expected}], 检测为[${detected}]`);
+        }
+    },
+
+    detectThoughtLeak: function(text) {
+        const keywords = ['思考：', '推理：', '分析：', '步骤', '首先', '其次', '然后', '最后', '作为AI', '我的推理', '决策过程'];
+        const sample = text.substring(0, 500).toLowerCase();
+        return keywords.some(kw => sample.includes(kw.toLowerCase()));
+    },
+
+    showToast: function(message, type = 'info') {
+        try {
+            const toast = window.toastr || window.notify;
+            if (!toast) { console.log(`[ConsistencyAnchor] ${message}`); return; }
+            const typeMap = {
+                'info': ['info', 'success'],
+                'warning': ['warning', 'warn', 'info'],
+                'error': ['error', 'danger', 'info'],
+                'success': ['success', 'info']
+            };
+            const candidates = typeMap[type] || ['info'];
+            let called = false;
+            for (const method of candidates) {
+                if (typeof toast[method] === 'function') {
+                    toast[method](message, '一致性锚');
+                    called = true;
                     break;
                 }
             }
-        }
-
-        fixFormat(text) {
-            if (!this.cachedNorms || !this.settings.formatAutoFix) return text;
-            let modified = text;
-            if (this.cachedNorms.dialogueWrap === '“' && modified.includes('"')) {
-                modified = modified.replace(/"([^"]*)"/g, '“$1”');
-            } else if (this.cachedNorms.dialogueWrap === '"' && modified.includes('“')) {
-                modified = modified.replace(/“([^”]*)”/g, '"$1"');
+            if (!called && typeof toast.info === 'function') {
+                toast.info(message, '一致性锚');
+            } else if (!called) {
+                console.log(`[ConsistencyAnchor] ${message}`);
             }
-            return modified;
-        }
+        } catch (e) { console.log(`[ConsistencyAnchor] ${message}`); }
+    },
 
-        leakCheck(text) {
-            const patterns = [/思考[：:]/, /作为AI/, /作为一个人工智能/, /内心想法[：:]/, /系统分析/];
-            return patterns.some(p => p.test(text));
-        }
+    // ---- 设置保存/读取 ----
+    saveSettings: function() {
+        try {
+            const ctx = stContext || window.SillyTavern?.getContext?.();
+            if (!ctx) return;
 
-        log(...args) { if (this.settings.debugMode) console.log('[一致性锚]', ...args); }
-        warn(...args) { console.warn('[一致性锚]', ...args); }
+            const idMap = {
+                'enabled': 'enabled',
+                'anchorFrequency': 'anchorFrequency',
+                'memoryPoolMaxTokens': 'memoryPoolMaxTokens',
+                'repetitionCheckCount': 'repetitionCheckCount',
+                'repetitionThreshold': 'repetitionThreshold',
+                'formatAutoFix': 'formatAutoFix',
+                'strictFormatCheck': 'strictFormatCheck',
+                'thoughtLeakIntercept': 'thoughtLeakIntercept',
+                'debugMode': 'debugMode',
+                'showFloatingBtn': 'ca-show-float'
+            };
+
+            const settings = {};
+            for (const [key, id] of Object.entries(idMap)) {
+                const input = document.getElementById(id);
+                if (!input) {
+                    console.warn(`[ConsistencyAnchor] UI 缺失警告: 找不到 HTML 元素 ID '${id}'，该设置将无法保存。`);
+                    continue;
+                }
+                if (input.type === 'checkbox') settings[key] = input.checked;
+                else if (input.type === 'number') settings[key] = id === 'repetitionThreshold' ? parseFloat(input.value) : parseInt(input.value, 10);
+                else settings[key] = input.value;
+            }
+
+            this.settings = { ...this.defaultSettings, ...this.settings, ...settings };
+            ctx.extensionSettings[extensionName] = this.settings;
+            
+            if (typeof ctx.saveSettingsDebounced === 'function') {
+                ctx.saveSettingsDebounced();
+            } else if (typeof ctx.saveSettings === 'function') {
+                ctx.saveSettings();
+            }
+
+            if (this.settings.showFloatingBtn) $('#anchor-toggle-btn').css('display', 'flex');
+            else $('#anchor-toggle-btn').hide();
+
+            this.showToast('设置已保存并生效', 'success');
+        } catch (e) {
+            console.error('[ConsistencyAnchor] 保存设置失败', e);
+            this.showToast('保存失败，请查看控制台', 'error');
+        }
+    },
+
+    loadSettingsToUI: function() {
+        try {
+            const idMap = {
+                'enabled': 'enabled',
+                'anchorFrequency': 'anchorFrequency',
+                'memoryPoolMaxTokens': 'memoryPoolMaxTokens',
+                'repetitionCheckCount': 'repetitionCheckCount',
+                'repetitionThreshold': 'repetitionThreshold',
+                'formatAutoFix': 'formatAutoFix',
+                'strictFormatCheck': 'strictFormatCheck',
+                'thoughtLeakIntercept': 'thoughtLeakIntercept',
+                'debugMode': 'debugMode',
+                'showFloatingBtn': 'ca-show-float'
+            };
+
+            for (const [key, id] of Object.entries(idMap)) {
+                const input = document.getElementById(id);
+                if (!input) {
+                    console.warn(`[ConsistencyAnchor] UI 缺失警告: 找不到 HTML 元素 ID '${id}'，无法渲染状态。`);
+                    continue;
+                }
+                if (input.type === 'checkbox') input.checked = !!this.settings[key];
+                else input.value = this.settings[key];
+            }
+        } catch (e) {
+            console.warn('[ConsistencyAnchor] 加载 UI 设置失败', e);
+        }
     }
+};
 
-    // 启动
-    const ext = new ConsistencyAnchor();
-    window.consistencyAnchor = ext;
-    await ext.init();
-    console.log('[一致性锚] 扩展加载完成');
-})();
+// =========================================================================
+// UI 视图层封装 (View & Event Binding)
+// =========================================================================
+const UIManager = {
+    htmlCache: null,
+
+    injectCSS: function() {
+        $('#ca-style-link').remove();
+        $('link[href$="/consistency-anchor/style.css"]').remove(); 
+        const link = document.createElement('link');
+        link.id = 'ca-style-link';
+        link.rel = 'stylesheet';
+        link.href = `${extensionPath}/style.css`;
+        document.head.appendChild(link);
+    },
+
+    injectMenuButton: function() {
+        $('#ca-bottom-menu-btn').remove();
+        const extensionsMenu = $('#extensionsMenu');
+        if (extensionsMenu.length > 0) {
+            extensionsMenu.append(`
+                <div id="ca-bottom-menu-btn" class="list-group-item flex-container alignitemscenter gap5" title="一致性锚设置" style="cursor:pointer; padding: 10px; color: var(--SmartThemeBodyColor, #dcdcdc); display: flex; align-items: center; gap: 8px;">
+                    <i class="fa-solid fa-anchor fa-fw"></i>
+                    <span>一致性锚设置</span>
+                </div>
+            `);
+            $('#ca-bottom-menu-btn').on('click', () => {
+                extensionsMenu.hide();
+                const panel = $('#consistency-anchor-panel');
+                if (panel.is(':visible')) panel.fadeOut();
+                else {
+                    panel.fadeIn();
+                    this.loadContent();
+                }
+            });
+        }
+    },
+
+    injectPanelAndFloatBtn: function() {
+        $('#consistency-anchor-panel').remove();
+        $('#anchor-toggle-btn').remove();
+
+        let posStyle = '';
+        const sPosLeft = window.ConsistencyAnchor.settings.btnPosLeft;
+        const sPosTop = window.ConsistencyAnchor.settings.btnPosTop;
+        if (sPosLeft && sPosTop) {
+            posStyle = `left: ${sPosLeft}; top: ${sPosTop}; right: auto; bottom: auto;`;
+        } else {
+            posStyle = `right: 20px; bottom: 80px;`;
+        }
+        const isShowFloat = window.ConsistencyAnchor.settings.showFloatingBtn;
+
+        const html = `
+            <div id="consistency-anchor-panel" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 520px; max-height: 80vh; background: #1a1a1a; border: 2px solid #b38b59; border-radius: 8px; z-index: 99998; display: none; overflow: hidden; box-shadow: 0 0 50px rgba(0,0,0,0.9);">
+                <div id="anchor-drag-handle" style="width: 100%; height: 40px; background: #242424; cursor: move; display: flex; justify-content: center; align-items: center; border-bottom: 1px solid #b38b59; color: #e0c5a1; font-weight: bold; position: relative;">
+                    <span>⚓ 一致性锚</span>
+                    <span id="anchor-close-btn" style="position: absolute; right: 15px; cursor: pointer; font-size: 18px;">✕</span>
+                </div>
+                <div id="anchor-content-area" style="height: calc(100% - 40px); overflow-y: auto; padding: 15px; color: #dcdcdc;">
+                    <div style="text-align:center; padding:30px; color:#888;">加载中...</div>
+                </div>
+            </div>
+            <div id="anchor-toggle-btn" style="position: fixed; ${posStyle} z-index: 99999; width: 45px; height: 45px; background: #b38b59; border-radius: 50%; display: ${isShowFloat ? 'flex' : 'none'}; justify-content: center; align-items: center; cursor: grab; box-shadow: 0 4px 10px rgba(0,0,0,0.5); color: #fff; font-size: 22px; user-select: none; opacity: 0.7; transition: opacity 0.2s;">
+                ⚓
+            </div>
+        `;
+        $('body').append(html);
+    },
+
+    setupDragAndInteractions: function() {
+        // 1. 悬浮按钮 全屏自由拖拽
+        const $floatBtn = $('#anchor-toggle-btn');
+        let isDraggingBtn = false;
+        let btnStartX, btnStartY, btnStartLeft, btnStartTop;
+
+        $floatBtn.on('mousedown', function(e) {
+            if (e.button !== 0) return;
+            isDraggingBtn = false;
+            btnStartX = e.clientX; btnStartY = e.clientY;
+            const rect = this.getBoundingClientRect();
+            btnStartLeft = rect.left; btnStartTop = rect.top;
+            $(this).css('cursor', 'grabbing');
+
+            const onMouseMove = (moveEvent) => {
+                const dx = moveEvent.clientX - btnStartX;
+                const dy = moveEvent.clientY - btnStartY;
+                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) isDraggingBtn = true;
+                if (!isDraggingBtn) return;
+
+                let newLeft = Math.max(0, Math.min(btnStartLeft + dx, window.innerWidth - rect.width));
+                let newTop = Math.max(0, Math.min(btnStartTop + dy, window.innerHeight - rect.height));
+                $floatBtn.css({ left: newLeft + 'px', top: newTop + 'px', right: 'auto', bottom: 'auto' });
+            };
+
+            const onMouseUp = () => {
+                $(document).off('mousemove.caBtnDrag mouseup.caBtnDrag');
+                $floatBtn.css('cursor', 'grab');
+                if (isDraggingBtn) {
+                    window.ConsistencyAnchor.settings.btnPosLeft = $floatBtn.css('left');
+                    window.ConsistencyAnchor.settings.btnPosTop = $floatBtn.css('top');
+                    window.ConsistencyAnchor.saveSettings();
+                }
+            };
+            $(document).on('mousemove.caBtnDrag', onMouseMove);
+            $(document).on('mouseup.caBtnDrag', onMouseUp);
+        });
+
+        $floatBtn.on('click', () => {
+            if (isDraggingBtn) return;
+            const panel = $('#consistency-anchor-panel');
+            if (panel.is(':visible')) panel.fadeOut();
+            else {
+                panel.fadeIn();
+                this.loadContent();
+            }
+        });
+
+        // 2. 顶栏拖拽
+        const $panel = $('#consistency-anchor-panel');
+        const $handle = $('#anchor-drag-handle');
+        let isDraggingPanel = false;
+
+        $handle.on('mousedown', function(e) {
+            if (e.button !== 0) return;
+            isDraggingPanel = true;
+            const startX = e.clientX; const startY = e.clientY;
+            const rect = $panel[0].getBoundingClientRect();
+            const startLeft = rect.left; const startTop = rect.top;
+
+            $panel.css({ transform: 'none', left: startLeft + 'px', top: startTop + 'px' });
+
+            const onMouseMove = (moveEvent) => {
+                if (!isDraggingPanel) return;
+                $panel.css({ left: startLeft + (moveEvent.clientX - startX) + 'px', top: startTop + (moveEvent.clientY - startY) + 'px' });
+            };
+            const onMouseUp = () => {
+                isDraggingPanel = false;
+                $(document).off('mousemove.caPanelDrag mouseup.caPanelDrag');
+            };
+            $(document).on('mousemove.caPanelDrag', onMouseMove);
+            $(document).on('mouseup.caPanelDrag', onMouseUp);
+        });
+
+        $('#anchor-close-btn').on('click', () => $('#consistency-anchor-panel').fadeOut());
+    },
+
+    bindFormEvents: function() {
+        if ($('#ca-show-float').length === 0) {
+            $('#anchor-content-area').prepend(`
+                <label class="checkbox_label" style="display:flex; align-items:center; gap:8px; margin-bottom:15px; padding:10px; background:rgba(255,255,255,0.05); border-radius:6px; border:1px solid #b38b59; cursor:pointer;">
+                    <input type="checkbox" id="ca-show-float">
+                    <span style="color:#e0c5a1; font-weight:bold; font-size:14px;">开启自由拖拽悬浮图标 (关闭可通过底部魔法棒打开)</span>
+                </label>
+            `);
+        }
+
+        window.ConsistencyAnchor.loadSettingsToUI();
+
+        $('#anchor-content-area input').off('change.caSettings').on('change.caSettings', () => {
+            window.ConsistencyAnchor.saveSettings();
+        });
+
+        $('#anchor-content-area button').each(function() {
+            if ($(this).text().includes('保存')) {
+                $(this).css('cursor', 'pointer').off('click.caSave').on('click.caSave', function() {
+                    window.ConsistencyAnchor.saveSettings();
+                    const btn = $(this);
+                    const originalText = btn.text();
+                    const originalBg = btn.css('background-color');
+                    btn.text('✓ 已保存').css('background-color', '#4caf50');
+                    setTimeout(() => btn.text(originalText).css('background-color', originalBg), 1500);
+                });
+            }
+        });
+    },
+
+    loadContent: async function() {
+        if (this.htmlCache) {
+            $('#anchor-content-area').html(this.htmlCache);
+            this.bindFormEvents();
+            return;
+        }
+
+        try {
+            const response = await fetch(`${extensionPath}/anchor.html`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            this.htmlCache = await response.text(); 
+            $('#anchor-content-area').html(this.htmlCache);
+            
+            this.bindFormEvents();
+            console.log('[ConsistencyAnchor] UI 加载完成，已缓存');
+        } catch (e) {
+            console.error('[ConsistencyAnchor] 加载 UI 失败:', e);
+            $('#anchor-content-area').html(`
+                <div style="padding:20px; color:#e57373; text-align:center;">
+                    <h3>加载失败</h3>
+                    <p>${e.message}</p>
+                    <p style="font-size:12px; color:#888;">请检查插件路径：<br>${extensionPath}</p>
+                </div>
+            `);
+        }
+    }
+};
+
+// =========================================================================
+// 初始化引导层 (超时保护 + 多路径检测)
+// =========================================================================
+let initIntervalTimer = setInterval(async () => {
+    const hasJQuery = typeof window.jQuery !== 'undefined' || typeof $ !== 'undefined';
+    if (window.SillyTavern && window.SillyTavern.getContext && hasJQuery) {
+        clearInterval(initIntervalTimer);
+        
+        // ★★★ 多路径检测（兼容老旧浏览器）★★★
+        try {
+            if (typeof import.meta !== 'undefined' && import.meta.url) {
+                extensionPath = new URL(import.meta.url).pathname.replace(/\/index\.js.*$/, '');
+            } else if (document.currentScript) {
+                const scriptSrc = document.currentScript.src;
+                if (scriptSrc) {
+                    extensionPath = scriptSrc.replace(/\/index\.js.*$/, '');
+                }
+            } else {
+                const scripts = document.querySelectorAll('script[src*="consistency-anchor"]');
+                if (scripts.length > 0) {
+                    extensionPath = scripts[0].src.replace(/\/index\.js.*$/, '');
+                }
+            }
+            
+            // 备用方案：当所有现代 API 都无法获取路径时
+            if (!extensionPath) {
+                console.warn('[ConsistencyAnchor] 无法自动解析路径，尝试 ST 1.13 标准后备路径');
+                extensionPath = '../../data/default-user/extensions/consistency_anchor';
+            }
+        } catch (e) {
+            console.warn('[ConsistencyAnchor] 路径检测引发异常，使用兜底路径', e);
+            extensionPath = '../../data/default-user/extensions/consistency_anchor'; 
+        }
+
+        console.log('[ConsistencyAnchor] 正在启动...');
+        
+        await window.ConsistencyAnchor.init();
+        
+        UIManager.injectCSS();
+        UIManager.injectPanelAndFloatBtn();
+        UIManager.injectMenuButton();
+        UIManager.setupDragAndInteractions();
+
+    } else {
+        initRetries++;
+        if (initRetries >= MAX_RETRIES) {
+            clearInterval(initIntervalTimer);
+            console.error('[ConsistencyAnchor] 加载失败：SillyTavern 环境未就绪超时（已达20秒）。');
+            window.toastr?.error?.('一致性锚插件加载超时，请刷新页面重试。', '启动错误');
+        }
+    }
+}, 500);
