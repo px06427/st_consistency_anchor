@@ -1,0 +1,69 @@
+<!-- 一致性锚设置面板 (纯净片段注入版) -->
+<div id="anchor-settings">
+
+    <!-- 顶栏开关群 -->
+    <div class="settings-group" style="background: rgba(179, 139, 89, 0.1); border-color: #b38b59;">
+        <label style="font-weight: bold; font-size: 15px;">
+            <input type="checkbox" id="ca-enabled" checked /> ⚡ 启用一致性锚核心
+        </label>
+        <label>
+            <input type="checkbox" id="ca-show-float" checked /> ⚓ 自由拖拽悬浮窗
+        </label>
+    </div>
+
+    <!-- 数值调节区 -->
+    <div class="settings-group">
+        <label>锚点注入频率 (每 N 轮)</label>
+        <input type="number" id="ca-anchorFrequency" min="1" max="10" value="3" />
+    </div>
+    
+    <div class="settings-group">
+        <label>记忆池最大 Token 截断</label>
+        <input type="number" id="ca-memoryPoolMaxTokens" min="50" max="500" value="200" />
+    </div>
+    
+    <div class="settings-group">
+        <label>生成重复检测缓存数</label>
+        <input type="number" id="ca-repetitionCheckCount" min="2" max="10" value="3" />
+    </div>
+    
+    <div class="settings-group">
+        <label>重复判定阈值 (0~1)</label>
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <input type="range" id="ca-repetitionThreshold" min="0" max="1" step="0.05" value="0.75" oninput="document.getElementById('ca-thresholdDisplay').textContent = parseFloat(this.value).toFixed(2)" />
+            <span id="ca-thresholdDisplay">0.75</span>
+        </div>
+    </div>
+
+    <!-- 功能开关区 -->
+    <div class="settings-group">
+        <label><input type="checkbox" id="ca-formatAutoFix" checked /> 自动修正动作与对话符号格式偏差</label>
+    </div>
+    
+    <div class="settings-group">
+        <label><input type="checkbox" id="ca-strictFormatCheck" checked /> 启用严格格式正则审查</label>
+    </div>
+    
+    <div class="settings-group">
+        <label><input type="checkbox" id="ca-thoughtLeakIntercept" checked /> 拦截 AI 泄露 CoT 思维链过程</label>
+    </div>
+
+    <!-- 状态栏扩展区 -->
+    <div class="settings-group vertical-group">
+        <label style="width: 100%; justify-content: center;">
+            <input type="checkbox" id="ca-enableStatusBar">
+            开启强制输出「状态栏/世界书附加设定」 (每回合末尾)
+        </label>
+        <textarea id="ca-statusBarPrompt" rows="3" placeholder="在此输入强制附加输出的系统指令..."></textarea>
+    </div>
+
+    <!-- 开发者区 -->
+    <div class="settings-group" style="justify-content: center; border: none; background: transparent;">
+        <label style="color: #888; font-size: 12px;">
+            <input type="checkbox" id="ca-debugMode" /> 控制台详细调试日志 (Debug Mode)
+        </label>
+    </div>
+
+    <!-- 保存按钮 -->
+    <button id="anchor-save-btn" class="general-btn">保存并应用设置</button>
+</div>
