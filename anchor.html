@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>一致性锚设置</title>
+    <style>
+        /* 此处样式由 style.css 提供，内联仅作后备 */
+    </style>
+</head>
+<body>
+    <div id="anchor-settings">
+        <h3 style="color: #e0c5a1; border-bottom: 1px solid #b38b59; padding-bottom: 8px; margin-top:0;">⚓ 一致性锚设置</h3>
+        <div class="settings-group">
+            <label><input type="checkbox" id="enabled" checked /> 启用插件</label>
+        </div>
+        <div class="settings-group">
+            <label>锚点注入频率 (每 N 轮) <input type="number" id="anchorFrequency" min="1" max="10" value="3" /></label>
+        </div>
+        <div class="settings-group">
+            <label>记忆池最大 Token <input type="number" id="memoryPoolMaxTokens" min="50" max="500" value="200" /></label>
+        </div>
+        <div class="settings-group">
+            <label>重复检测缓存数 <input type="number" id="repetitionCheckCount" min="2" max="10" value="3" /></label>
+        </div>
+        <div class="settings-group">
+            <label>重复判定阈值 (0~1)
+                <input type="range" id="repetitionThreshold" min="0" max="1" step="0.05" value="0.7" />
+                <span id="thresholdDisplay">0.70</span>
+            </label>
+        </div>
+        <div class="settings-group">
+            <label><input type="checkbox" id="formatAutoFix" checked /> 自动修正轻微格式偏差</label>
+        </div>
+        <div class="settings-group">
+            <label><input type="checkbox" id="strictFormatCheck" checked /> 严格格式检查</label>
+        </div>
+        <div class="settings-group">
+            <label><input type="checkbox" id="thoughtLeakIntercept" checked /> 启用思维链拦截</label>
+        </div>
+        <div class="settings-group">
+            <label><input type="checkbox" id="debugMode" /> 调试模式</label>
+        </div>
+        <button id="anchor-save-btn" class="general-btn" style="margin-top: 10px;">保存设置</button>
+        <div id="anchor-status" style="margin-top: 10px; color: #aaa; font-style: italic;"></div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const saveBtn = document.getElementById('anchor-save-btn');
+            if (saveBtn) {
+                saveBtn.addEventListener('click', function() {
+                    if (window.ConsistencyAnchor) {
+                        window.ConsistencyAnchor.saveSettings();
+                        document.getElementById('anchor-status').textContent = '✅ 设置已保存';
+                        setTimeout(() => {
+                            document.getElementById('anchor-status').textContent = '';
+                        }, 3000);
+                    } else {
+                        alert('插件未初始化，请刷新页面重试。');
+                    }
+                });
+            }
+            const slider = document.getElementById('repetitionThreshold');
+            if (slider) {
+                slider.addEventListener('input', function() {
+                    const display = document.getElementById('thresholdDisplay');
+                    if (display) display.textContent = parseFloat(this.value).toFixed(2);
+                });
+            }
+        });
+    </script>
+</body>
+</html>

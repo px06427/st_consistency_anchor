@@ -1,0 +1,10 @@
+{
+  "name": "consistency_anchor",
+  "display_name": "一致性锚 (Consistency Anchor)",
+  "author": "GanluWine",
+  "version": "1.0.0",
+  "description": "防止人称漂移、机械复读、格式掉落、设定遗忘与思维链泄露的高阶生成保障插件。",
+  "js": "index.js",
+  "css": "style.css",
+  "html": "anchor.html"
+}
