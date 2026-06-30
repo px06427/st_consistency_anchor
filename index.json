@@ -1,0 +1,12 @@
+{
+  "extensions": [
+    {
+      "name": "Consistency_Anchor",
+      "type": "extension",
+      "description": "防止人称漂移、机械复读、格式掉落、设定遗忘与思维链泄露。",
+      "author": "GanluWine",
+      "version": "1.0.0",
+      "url": "https://github.com/px06427/Ganlu-wine/raw/refs/heads/main/my-st-extensions/consistency_anchor"
+    }
+  ]
+}
