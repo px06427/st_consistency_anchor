@@ -1,0 +1,16 @@
+{
+    "display_name": "一致性锚 (Consistency Anchor)",
+    "type": "extension",
+    "author": "GanluWine",
+    "version": "1.0.2",
+    "description": "防止人称漂移、机械复读、格式掉落、设定遗忘与思维链泄露的高阶生成保障插件。",
+    "entry": "index.js",
+    "js": "index.js",
+    "css": "style.css",
+    "ui": true,
+    "permission": ["context", "events", "extension-settings"],
+    "loading_order": 0,
+    "requires": []
+    "homePage": "https://github.com/px06427/Ganlu-wine",
+    "license": "MIT"
+}

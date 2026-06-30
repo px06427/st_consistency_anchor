@@ -1,0 +1,16 @@
+/* 一致性锚设置面板样式 */
+.consistency-anchor-settings .inline-drawer-header {
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.consistency-anchor-settings .flex-container.flexFlowColumn {
+    margin-bottom: 8px;
+}
+.consistency-anchor-settings input[type="number"] {
+    margin-top: 4px;
+}
+.marginTop10 {
+    margin-top: 10px;
+}
