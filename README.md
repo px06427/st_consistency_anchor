@@ -1,6 +1,6 @@
 # ⚓ 一致性锚 (Consistency Anchor)
 
-[![SillyTavern](https://img.shields.io/badge/SillyTavern-1.18%2B-8A2BE2?style=flat-square&logo=github)](https://github.com/SillyTavern/SillyTavern)
+[![SillyTavern](https://img.shields.io/badge/SillyTavern-1.13%2B-8A2BE2?style=flat-square&logo=github)](https://github.com/SillyTavern/SillyTavern)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
 [![Version](https://img.shields.io/badge/version-1.0.0-blue?style=flat-square)](./manifest.json)
 
