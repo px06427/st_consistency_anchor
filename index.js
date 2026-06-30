@@ -1,33 +1,35 @@
 /**
- * 一致性锚 (Consistency Anchor) - 完美开源发版 (Open Source Ready)
- * 包含：模块化 UI 管理、事件降级兼容、UI 懒加载缓存、超时防死循环保护、精准防误触、ST 1.13+ 多路径兼容
- */
+ * 一致性锚 (Consistency Anchor) */
 
 const extensionName = "consistency-anchor";
 const MAX_RETRIES = 40; // 40次 * 500ms = 20秒超时
 let initRetries = 0;
-let stContext = null;
 let extensionPath = '';
 
 // =========================================================================
-// 兼容层：SillyTavern 事件名称降级映射 (适配新老版本 ST)
+// 核心工具方法
 // =========================================================================
+function getSTContext() {
+    return window.SillyTavern?.getContext?.() || null;
+}
+
+// 兼容层：SillyTavern 事件名称降级映射 (适配新老版本 ST)
 const ST_EVENTS = {
-    get CHAT_CHANGED() { 
-        return window.event_types?.CHAT_CHANGED 
-            || window.EVENT_CHAT_CHANGED 
-            || 'chat_changed'; 
+    get CHAT_CHANGED() {
+        return window.event_types?.CHAT_CHANGED
+            || window.EVENT_CHAT_CHANGED
+            || 'chat_changed';
     },
-    get GENERATE_BEFORE() { 
-        return window.event_types?.GENERATE_BEFORE 
-            || window.event_types?.TEXT_COMPLETION_BEFORE 
-            || window.EVENT_GENERATE_BEFORE 
-            || 'text_completion_before'; 
+    get GENERATE_BEFORE() {
+        return window.event_types?.GENERATE_BEFORE
+            || window.event_types?.TEXT_COMPLETION_BEFORE
+            || window.EVENT_GENERATE_BEFORE
+            || 'text_completion_before';
     },
-    get MESSAGE_RECEIVED() { 
-        return window.event_types?.MESSAGE_RECEIVED 
-            || window.EVENT_MESSAGE_RECEIVED 
-            || 'message_received'; 
+    get MESSAGE_RECEIVED() {
+        return window.event_types?.MESSAGE_RECEIVED
+            || window.EVENT_MESSAGE_RECEIVED
+            || 'message_received';
     }
 };
 
@@ -48,7 +50,11 @@ window.ConsistencyAnchor = {
         debugMode: false,
         showFloatingBtn: true,
         btnPosLeft: '',
-        btnPosTop: ''
+        btnPosTop: '',
+        // ★★★ 世界书状态栏强制输出设定 ★★★
+        enableStatusBar: false, 
+        statusBarPrompt: '【系统指令：请务必阅读并严格遵循世界书(Lorebook)中关于“状态栏/面板/附加设定”的格式规范。在完成正文描写后，必须在回复的最末尾换行并独立输出当前的状态栏，且各项数值与状态需根据当前剧情逻辑进行合理计算与更新。】',
+        statusBarPosition: 'after' // 默认注入位置
     },
     cachedNorms: null,
     cachedCharacterId: null,
@@ -70,9 +76,8 @@ window.ConsistencyAnchor = {
             console.warn('[ConsistencyAnchor] 已销毁，无法重新初始化');
             return;
         }
-        const ctx = window.SillyTavern?.getContext?.();
+        const ctx = getSTContext();
         if (!ctx) return;
-        stContext = ctx;
 
         // 加载设置
         if (ctx.extensionSettings[extensionName]) {
@@ -96,7 +101,7 @@ window.ConsistencyAnchor = {
         this.destroy();
         this._destroyed = false;
 
-        // 安全绑定事件（兼容新旧版本）
+        // 安全绑定事件
         if (window.eventSource) {
             this._boundOnChatChanged = this.onChatChanged.bind(this);
             this._boundOnGenerateBefore = this.onGenerateBefore.bind(this);
@@ -112,7 +117,6 @@ window.ConsistencyAnchor = {
         if (this.settings.debugMode) console.log('[ConsistencyAnchor] 初始化完成');
     },
 
-    // ---- 销毁/解绑 ----
     destroy: function() {
         if (this._destroyed) return;
         if (window.eventSource) {
@@ -129,14 +133,22 @@ window.ConsistencyAnchor = {
                 this._boundOnMessageReceived = null;
             }
         }
+        
+        // 彻底清理内存缓存
+        this.aiReplyCache = [];
+        this.cachedNorms = null;
+        this.cachedCharacterId = null;
+        this.highPriorityMemories = '';
+        this.messageCounter = 0;
+        this.lastInjectionRound = -1;
+
         this._initialized = false;
         this._destroyed = true;
     },
 
-    // ---- 规范解析 ----
     refreshCharacterNorms: async function() {
         try {
-            const ctx = stContext || window.SillyTavern?.getContext?.();
+            const ctx = getSTContext();
             const charId = ctx?.characterId || 'default';
             if (this.cachedCharacterId === charId && this.cachedNorms) return;
             const char = ctx?.characters?.[charId];
@@ -164,10 +176,9 @@ window.ConsistencyAnchor = {
         return norms;
     },
 
-    // ---- 记忆池解析 ----
     refreshHighPriorityMemories: async function() {
         try {
-            const ctx = stContext || window.SillyTavern?.getContext?.();
+            const ctx = getSTContext();
             const worldInfo = ctx?.worldInfo || window.worldInfo;
             let entries = [];
             if (worldInfo && typeof worldInfo.getEntries === 'function') entries = worldInfo.getEntries();
@@ -183,7 +194,14 @@ window.ConsistencyAnchor = {
         if (!Array.isArray(entries)) return '';
         const high = entries.filter(e => e.priority === 'high' || e.key?.startsWith('!'));
         if (!high.length) return '';
-        high.sort((a, b) => (b.priorityValue || 0) - (a.priorityValue || 0));
+        
+        // 安全解析 priorityValue，防止 NaN
+        high.sort((a, b) => {
+            const valA = a.priorityValue !== undefined ? Number(a.priorityValue) || 0 : 0;
+            const valB = b.priorityValue !== undefined ? Number(b.priorityValue) || 0 : 0;
+            return valB - valA;
+        });
+
         let combined = '', tokens = 0;
         for (const e of high) {
             const content = e.content || e.text || '';
@@ -195,7 +213,6 @@ window.ConsistencyAnchor = {
         return combined.trim();
     },
 
-    // ---- 生命周期监听 ----
     onChatChanged: async function() {
         this.messageCounter = 0;
         this.lastInjectionRound = -1;
@@ -216,18 +233,25 @@ window.ConsistencyAnchor = {
         }
         if (this.highPriorityMemories) this.injectMemoryPool(eventData);
         if (this.settings.thoughtLeakIntercept) this.injectAntiLeakDirective(eventData);
+
+        // ★★★ 每回合按设定位置插入状态栏提醒 ★★★
+        if (this.settings.enableStatusBar && this.settings.statusBarPrompt) {
+            const pos = this.settings.statusBarPosition || 'after';
+            this.safeInject(this.settings.statusBarPrompt, eventData, pos);
+            if (this.settings.debugMode) console.log(`[ConsistencyAnchor] 注入状态栏提醒 (位置: ${pos})`);
+        }
     },
 
     safeInject: function(text, eventData, position = 'before') {
         try {
-            const ctx = stContext || window.SillyTavern?.getContext?.();
+            const ctx = getSTContext();
             if (ctx && typeof ctx.injectPrompt === 'function') {
                 ctx.injectPrompt(text, position);
                 return true;
             }
             if (eventData && typeof eventData.prompt === 'string') {
-                eventData.prompt = position === 'before' 
-                    ? (text + '\n' + eventData.prompt) 
+                eventData.prompt = position === 'before'
+                    ? (text + '\n' + eventData.prompt)
                     : (eventData.prompt + '\n' + text);
                 return true;
             }
@@ -256,9 +280,10 @@ window.ConsistencyAnchor = {
 
     onMessageReceived: async function({ message }) {
         if (!this.settings.enabled || !message) return;
+
         const isUserMessage = message.is_user === true || message.role === 'user';
         if (isUserMessage) return;
-        
+
         const aiText = message.text || message.content || '';
         if (!aiText || aiText.length < 5) return;
 
@@ -276,17 +301,25 @@ window.ConsistencyAnchor = {
         this.aiReplyCache.push(aiText);
         if (this.aiReplyCache.length > this.settings.repetitionCheckCount) this.aiReplyCache.shift();
 
-        // 格式修正
+        // 格式修正 (包含安全的 message 更新逻辑)
         if (this.settings.formatAutoFix || this.settings.strictFormatCheck) {
             const fixed = this.validateAndFixFormat(aiText);
             if (fixed && fixed !== aiText && this.settings.formatAutoFix) {
-                const newMsg = { ...message, text: fixed, content: fixed };
                 try {
-                    const ctx = stContext || window.SillyTavern?.getContext?.();
+                    const ctx = getSTContext();
                     if (ctx && typeof ctx.updateMessage === 'function') {
-                        ctx.updateMessage(newMsg);
+                        // 尝试获取完整的原始对象，防止 ST 验证失败
+                        const oldMsg = typeof ctx.getMessageById === 'function' ? ctx.getMessageById(message.id) : message;
+                        if (oldMsg) {
+                            const newMsg = { ...oldMsg, text: fixed, content: fixed };
+                            ctx.updateMessage(newMsg);
+                        } else {
+                            ctx.updateMessage({ ...message, text: fixed, content: fixed });
+                        }
                     } else {
-                        if (this.settings.debugMode) console.warn('[ConsistencyAnchor] 格式偏差已检测，请手动编辑:', fixed);
+                        if (this.settings.debugMode) {
+                            console.warn('[ConsistencyAnchor] 格式偏差已检测，请手动编辑:', fixed);
+                        }
                         if (!this._formatFixToastShown) {
                             this._formatFixToastShown = true;
                             this.showToast('格式检测到偏差，请双击消息手动修正', 'warning');
@@ -294,7 +327,7 @@ window.ConsistencyAnchor = {
                         }
                     }
                 } catch (e) {
-                    console.warn('[ConsistencyAnchor] 无法更新消息内容', e);
+                    console.warn('[ConsistencyAnchor] 格式修正失败', e);
                 }
             }
         }
@@ -330,9 +363,24 @@ window.ConsistencyAnchor = {
         const norms = this.cachedNorms;
         if (!norms) return null;
         let fixed = text;
+        
+        // 修正对话
         if (norms.dialogueWrap === '“') fixed = fixed.replace(/"([^"]*)"/g, '“$1”');
         else if (norms.dialogueWrap === '"') fixed = fixed.replace(/“([^”]*)”/g, '"$1"');
+        
+        // 修正动作
         if (norms.actionWrap === '*') fixed = fixed.replace(/\*\*([^*]+)\*\*/g, '*$1*');
+        
+        // ★★★ 修正内心独白 ★★★
+        if (norms.innerThoughtWrap === '()') {
+            fixed = fixed.replace(/（([^）]*)）/g, '($1)');
+        } else if (norms.innerThoughtWrap === '（）') {
+            fixed = fixed.replace(/\(([^)]*)\)/g, '（$1）');
+        } else if (norms.innerThoughtWrap === '『』') {
+            // 将普通括号强制转为『』
+            fixed = fixed.replace(/[\(（]([^)）]+)[\)）]/g, '『$1』');
+        }
+        
         return fixed !== text ? fixed : null;
     },
 
@@ -381,40 +429,42 @@ window.ConsistencyAnchor = {
         } catch (e) { console.log(`[ConsistencyAnchor] ${message}`); }
     },
 
-    // ---- 设置保存/读取 ----
     saveSettings: function() {
         try {
-            const ctx = stContext || window.SillyTavern?.getContext?.();
+            const ctx = getSTContext();
             if (!ctx) return;
-
             const idMap = {
-                'enabled': 'enabled',
-                'anchorFrequency': 'anchorFrequency',
-                'memoryPoolMaxTokens': 'memoryPoolMaxTokens',
-                'repetitionCheckCount': 'repetitionCheckCount',
-                'repetitionThreshold': 'repetitionThreshold',
-                'formatAutoFix': 'formatAutoFix',
-                'strictFormatCheck': 'strictFormatCheck',
-                'thoughtLeakIntercept': 'thoughtLeakIntercept',
-                'debugMode': 'debugMode',
-                'showFloatingBtn': 'ca-show-float'
+                'enabled': 'ca-enabled',
+                'anchorFrequency': 'ca-anchorFrequency',
+                'memoryPoolMaxTokens': 'ca-memoryPoolMaxTokens',
+                'repetitionCheckCount': 'ca-repetitionCheckCount',
+                'repetitionThreshold': 'ca-repetitionThreshold',
+                'formatAutoFix': 'ca-formatAutoFix',
+                'strictFormatCheck': 'ca-strictFormatCheck',
+                'thoughtLeakIntercept': 'ca-thoughtLeakIntercept',
+                'debugMode': 'ca-debugMode',
+                'showFloatingBtn': 'ca-show-float',
+                'enableStatusBar': 'ca-enableStatusBar',
+                'statusBarPrompt': 'ca-statusBarPrompt',
+                'statusBarPosition': 'ca-statusBarPosition'
             };
-
+            
             const settings = {};
             for (const [key, id] of Object.entries(idMap)) {
-                const input = document.getElementById(id);
+                const input = document.getElementById(id) || document.getElementById(key);
                 if (!input) {
-                    console.warn(`[ConsistencyAnchor] UI 缺失警告: 找不到 HTML 元素 ID '${id}'，该设置将无法保存。`);
+                    // ★★★ UI Fallback 防丢失设定 ★★★
+                    settings[key] = this.settings[key];
                     continue;
                 }
                 if (input.type === 'checkbox') settings[key] = input.checked;
-                else if (input.type === 'number') settings[key] = id === 'repetitionThreshold' ? parseFloat(input.value) : parseInt(input.value, 10);
+                else if (input.type === 'number') settings[key] = (key === 'repetitionThreshold') ? parseFloat(input.value) : parseInt(input.value, 10);
                 else settings[key] = input.value;
             }
-
+            
             this.settings = { ...this.defaultSettings, ...this.settings, ...settings };
             ctx.extensionSettings[extensionName] = this.settings;
-            
+
             if (typeof ctx.saveSettingsDebounced === 'function') {
                 ctx.saveSettingsDebounced();
             } else if (typeof ctx.saveSettings === 'function') {
@@ -423,8 +473,7 @@ window.ConsistencyAnchor = {
 
             if (this.settings.showFloatingBtn) $('#anchor-toggle-btn').css('display', 'flex');
             else $('#anchor-toggle-btn').hide();
-
-            this.showToast('设置已保存并生效', 'success');
+            this.showToast('设置已保存', 'success');
         } catch (e) {
             console.error('[ConsistencyAnchor] 保存设置失败', e);
             this.showToast('保存失败，请查看控制台', 'error');
@@ -434,24 +483,23 @@ window.ConsistencyAnchor = {
     loadSettingsToUI: function() {
         try {
             const idMap = {
-                'enabled': 'enabled',
-                'anchorFrequency': 'anchorFrequency',
-                'memoryPoolMaxTokens': 'memoryPoolMaxTokens',
-                'repetitionCheckCount': 'repetitionCheckCount',
-                'repetitionThreshold': 'repetitionThreshold',
-                'formatAutoFix': 'formatAutoFix',
-                'strictFormatCheck': 'strictFormatCheck',
-                'thoughtLeakIntercept': 'thoughtLeakIntercept',
-                'debugMode': 'debugMode',
-                'showFloatingBtn': 'ca-show-float'
+                'enabled': 'ca-enabled',
+                'anchorFrequency': 'ca-anchorFrequency',
+                'memoryPoolMaxTokens': 'ca-memoryPoolMaxTokens',
+                'repetitionCheckCount': 'ca-repetitionCheckCount',
+                'repetitionThreshold': 'ca-repetitionThreshold',
+                'formatAutoFix': 'ca-formatAutoFix',
+                'strictFormatCheck': 'ca-strictFormatCheck',
+                'thoughtLeakIntercept': 'ca-thoughtLeakIntercept',
+                'debugMode': 'ca-debugMode',
+                'showFloatingBtn': 'ca-show-float',
+                'enableStatusBar': 'ca-enableStatusBar',
+                'statusBarPrompt': 'ca-statusBarPrompt',
+                'statusBarPosition': 'ca-statusBarPosition'
             };
-
             for (const [key, id] of Object.entries(idMap)) {
-                const input = document.getElementById(id);
-                if (!input) {
-                    console.warn(`[ConsistencyAnchor] UI 缺失警告: 找不到 HTML 元素 ID '${id}'，无法渲染状态。`);
-                    continue;
-                }
+                const input = document.getElementById(id) || document.getElementById(key);
+                if (!input) continue;
                 if (input.type === 'checkbox') input.checked = !!this.settings[key];
                 else input.value = this.settings[key];
             }
@@ -466,10 +514,9 @@ window.ConsistencyAnchor = {
 // =========================================================================
 const UIManager = {
     htmlCache: null,
-
     injectCSS: function() {
         $('#ca-style-link').remove();
-        $('link[href$="/consistency-anchor/style.css"]').remove(); 
+        $('link[href$="/consistency-anchor/style.css"]').remove();
         const link = document.createElement('link');
         link.id = 'ca-style-link';
         link.rel = 'stylesheet';
@@ -482,7 +529,7 @@ const UIManager = {
         const extensionsMenu = $('#extensionsMenu');
         if (extensionsMenu.length > 0) {
             extensionsMenu.append(`
-                <div id="ca-bottom-menu-btn" class="list-group-item flex-container alignitemscenter gap5" title="一致性锚设置" style="cursor:pointer; padding: 10px; color: var(--SmartThemeBodyColor, #dcdcdc); display: flex; align-items: center; gap: 8px;">
+                <div id="ca-bottom-menu-btn" class="list-group-item flex-container alignitemscenter gap5" title="一致性锚设置" style="cursor:pointer; padding: 10px 12px; color: var(--SmartThemeBodyColor, #dcdcdc); display: flex; align-items: center; gap: 8px; font-size: clamp(13px, 3.5vw, 15px);">
                     <i class="fa-solid fa-anchor fa-fw"></i>
                     <span>一致性锚设置</span>
                 </div>
@@ -514,16 +561,16 @@ const UIManager = {
         const isShowFloat = window.ConsistencyAnchor.settings.showFloatingBtn;
 
         const html = `
-            <div id="consistency-anchor-panel" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 520px; max-height: 80vh; background: #1a1a1a; border: 2px solid #b38b59; border-radius: 8px; z-index: 99998; display: none; overflow: hidden; box-shadow: 0 0 50px rgba(0,0,0,0.9);">
-                <div id="anchor-drag-handle" style="width: 100%; height: 40px; background: #242424; cursor: move; display: flex; justify-content: center; align-items: center; border-bottom: 1px solid #b38b59; color: #e0c5a1; font-weight: bold; position: relative;">
+            <div id="consistency-anchor-panel" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(520px, 92vw); max-height: 80vh; background: #1a1a1a; border: 2px solid #b38b59; border-radius: 8px; z-index: 99998; display: none; overflow: hidden; box-shadow: 0 0 50px rgba(0,0,0,0.9);">
+                <div id="anchor-drag-handle" style="width: 100%; height: 40px; background: #242424; cursor: move; display: flex; justify-content: center; align-items: center; border-bottom: 1px solid #b38b59; color: #e0c5a1; font-weight: bold; position: relative; touch-action: none;">
                     <span>⚓ 一致性锚</span>
-                    <span id="anchor-close-btn" style="position: absolute; right: 15px; cursor: pointer; font-size: 18px;">✕</span>
+                    <span id="anchor-close-btn" style="position: absolute; right: 10px; cursor: pointer; font-size: 18px; padding: 10px 12px; line-height: 1;">✕</span>
                 </div>
                 <div id="anchor-content-area" style="height: calc(100% - 40px); overflow-y: auto; padding: 15px; color: #dcdcdc;">
                     <div style="text-align:center; padding:30px; color:#888;">加载中...</div>
                 </div>
             </div>
-            <div id="anchor-toggle-btn" style="position: fixed; ${posStyle} z-index: 99999; width: 45px; height: 45px; background: #b38b59; border-radius: 50%; display: ${isShowFloat ? 'flex' : 'none'}; justify-content: center; align-items: center; cursor: grab; box-shadow: 0 4px 10px rgba(0,0,0,0.5); color: #fff; font-size: 22px; user-select: none; opacity: 0.7; transition: opacity 0.2s;">
+            <div id="anchor-toggle-btn" style="position: fixed; ${posStyle} z-index: 99999; width: clamp(40px, 12vw, 50px); height: clamp(40px, 12vw, 50px); background: #b38b59; border-radius: 50%; display: ${isShowFloat ? 'flex' : 'none'}; justify-content: center; align-items: center; cursor: grab; box-shadow: 0 4px 10px rgba(0,0,0,0.5); color: #fff; font-size: clamp(18px, 5vw, 24px); user-select: none; opacity: 0.7; transition: opacity 0.2s; touch-action: none;">
                 ⚓
             </div>
         `;
@@ -531,77 +578,110 @@ const UIManager = {
     },
 
     setupDragAndInteractions: function() {
-        // 1. 悬浮按钮 全屏自由拖拽
         const $floatBtn = $('#anchor-toggle-btn');
         let isDraggingBtn = false;
         let btnStartX, btnStartY, btnStartLeft, btnStartTop;
 
+        function startBtnDrag(clientX, clientY) {
+            isDraggingBtn = false;
+            btnStartX = clientX;
+            btnStartY = clientY;
+            const rect = $floatBtn[0].getBoundingClientRect();
+            btnStartLeft = rect.left;
+            btnStartTop = rect.top;
+            $floatBtn.css('cursor', 'grabbing');
+        }
+
+        function moveBtnDrag(clientX, clientY) {
+            const dx = clientX - btnStartX;
+            const dy = clientY - btnStartY;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) isDraggingBtn = true;
+            if (!isDraggingBtn) return;
+            const rect = $floatBtn[0].getBoundingClientRect();
+            let newLeft = Math.max(0, Math.min(btnStartLeft + dx, window.innerWidth - rect.width));
+            let newTop = Math.max(0, Math.min(btnStartTop + dy, window.innerHeight - rect.height));
+            $floatBtn.css({ left: newLeft + 'px', top: newTop + 'px', right: 'auto', bottom: 'auto' });
+        }
+
+        function endBtnDrag() {
+            $(document).off('mousemove.caBtnDrag mouseup.caBtnDrag touchmove.caBtnDrag touchend.caBtnDrag touchcancel.caBtnDrag');
+            $floatBtn.css('cursor', 'grab');
+            if (isDraggingBtn) {
+                window.ConsistencyAnchor.settings.btnPosLeft = $floatBtn.css('left');
+                window.ConsistencyAnchor.settings.btnPosTop = $floatBtn.css('top');
+                window.ConsistencyAnchor.saveSettings();
+            }
+        }
+
         $floatBtn.on('mousedown', function(e) {
             if (e.button !== 0) return;
-            isDraggingBtn = false;
-            btnStartX = e.clientX; btnStartY = e.clientY;
-            const rect = this.getBoundingClientRect();
-            btnStartLeft = rect.left; btnStartTop = rect.top;
-            $(this).css('cursor', 'grabbing');
-
-            const onMouseMove = (moveEvent) => {
-                const dx = moveEvent.clientX - btnStartX;
-                const dy = moveEvent.clientY - btnStartY;
-                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) isDraggingBtn = true;
-                if (!isDraggingBtn) return;
-
-                let newLeft = Math.max(0, Math.min(btnStartLeft + dx, window.innerWidth - rect.width));
-                let newTop = Math.max(0, Math.min(btnStartTop + dy, window.innerHeight - rect.height));
-                $floatBtn.css({ left: newLeft + 'px', top: newTop + 'px', right: 'auto', bottom: 'auto' });
-            };
-
-            const onMouseUp = () => {
-                $(document).off('mousemove.caBtnDrag mouseup.caBtnDrag');
-                $floatBtn.css('cursor', 'grab');
-                if (isDraggingBtn) {
-                    window.ConsistencyAnchor.settings.btnPosLeft = $floatBtn.css('left');
-                    window.ConsistencyAnchor.settings.btnPosTop = $floatBtn.css('top');
-                    window.ConsistencyAnchor.saveSettings();
-                }
-            };
-            $(document).on('mousemove.caBtnDrag', onMouseMove);
-            $(document).on('mouseup.caBtnDrag', onMouseUp);
+            startBtnDrag(e.clientX, e.clientY);
+            $(document).on('mousemove.caBtnDrag', (ev) => moveBtnDrag(ev.clientX, ev.clientY));
+            $(document).on('mouseup.caBtnDrag', endBtnDrag);
         });
 
-        $floatBtn.on('click', () => {
+        $floatBtn.on('touchstart', function(e) {
+            const touch = e.originalEvent?.touches?.[0] || e.touches?.[0];
+            if (!touch) return;
+            startBtnDrag(touch.clientX, touch.clientY);
+            $(document).on('touchmove.caBtnDrag', (ev) => {
+                const t = ev.originalEvent?.touches?.[0] || ev.touches?.[0];
+                if (t) moveBtnDrag(t.clientX, t.clientY);
+            });
+            $(document).on('touchend.caBtnDrag touchcancel.caBtnDrag', endBtnDrag);
+        });
+
+        $floatBtn.on('click', function() {
             if (isDraggingBtn) return;
             const panel = $('#consistency-anchor-panel');
             if (panel.is(':visible')) panel.fadeOut();
             else {
                 panel.fadeIn();
-                this.loadContent();
+                UIManager.loadContent();
             }
         });
 
-        // 2. 顶栏拖拽
         const $panel = $('#consistency-anchor-panel');
         const $handle = $('#anchor-drag-handle');
         let isDraggingPanel = false;
+        let panelStartX, panelStartY, panelStartLeft, panelStartTop;
+
+        function startPanelDrag(clientX, clientY) {
+            isDraggingPanel = true;
+            panelStartX = clientX;
+            panelStartY = clientY;
+            const rect = $panel[0].getBoundingClientRect();
+            panelStartLeft = rect.left;
+            panelStartTop = rect.top;
+            $panel.css({ transform: 'none', left: panelStartLeft + 'px', top: panelStartTop + 'px' });
+        }
+
+        function movePanelDrag(clientX, clientY) {
+            if (!isDraggingPanel) return;
+            $panel.css({ left: panelStartLeft + (clientX - panelStartX) + 'px', top: panelStartTop + (clientY - panelStartY) + 'px' });
+        }
+
+        function endPanelDrag() {
+            isDraggingPanel = false;
+            $(document).off('mousemove.caPanelDrag mouseup.caPanelDrag touchmove.caPanelDrag touchend.caPanelDrag touchcancel.caPanelDrag');
+        }
 
         $handle.on('mousedown', function(e) {
             if (e.button !== 0) return;
-            isDraggingPanel = true;
-            const startX = e.clientX; const startY = e.clientY;
-            const rect = $panel[0].getBoundingClientRect();
-            const startLeft = rect.left; const startTop = rect.top;
+            startPanelDrag(e.clientX, e.clientY);
+            $(document).on('mousemove.caPanelDrag', (ev) => movePanelDrag(ev.clientX, ev.clientY));
+            $(document).on('mouseup.caPanelDrag', endPanelDrag);
+        });
 
-            $panel.css({ transform: 'none', left: startLeft + 'px', top: startTop + 'px' });
-
-            const onMouseMove = (moveEvent) => {
-                if (!isDraggingPanel) return;
-                $panel.css({ left: startLeft + (moveEvent.clientX - startX) + 'px', top: startTop + (moveEvent.clientY - startY) + 'px' });
-            };
-            const onMouseUp = () => {
-                isDraggingPanel = false;
-                $(document).off('mousemove.caPanelDrag mouseup.caPanelDrag');
-            };
-            $(document).on('mousemove.caPanelDrag', onMouseMove);
-            $(document).on('mouseup.caPanelDrag', onMouseUp);
+        $handle.on('touchstart', function(e) {
+            const touch = e.originalEvent?.touches?.[0] || e.touches?.[0];
+            if (!touch) return;
+            startPanelDrag(touch.clientX, touch.clientY);
+            $(document).on('touchmove.caPanelDrag', (ev) => {
+                const t = ev.originalEvent?.touches?.[0] || ev.touches?.[0];
+                if (t) movePanelDrag(t.clientX, t.clientY);
+            });
+            $(document).on('touchend.caPanelDrag touchcancel.caPanelDrag', endPanelDrag);
         });
 
         $('#anchor-close-btn').on('click', () => $('#consistency-anchor-panel').fadeOut());
@@ -617,22 +697,47 @@ const UIManager = {
             `);
         }
 
+        if ($('#ca-enableStatusBar').length === 0) {
+            $('#anchor-content-area').append(`
+                <hr style="border-color: var(--SmartThemeBorderColor); margin: 15px 0;">
+                <label class="checkbox_label" style="display:flex; align-items:center; gap:8px; margin-bottom:8px; cursor:pointer;">
+                    <input type="checkbox" id="ca-enableStatusBar">
+                    <span style="color:#e0c5a1; font-weight:bold; font-size:14px;">开启世界书状态栏/附加数据强制输出 (每回合末尾)</span>
+                </label>
+                <div style="margin-bottom: 10px; width: 100%;">
+                    <label style="display:block; margin-bottom:5px; color:var(--SmartThemeBodyColor); font-size:13px;">注入位置：</label>
+                    <select id="ca-statusBarPosition" style="width:100%; background:var(--SmartThemeControlColor, #222); color:var(--SmartThemeBodyColor, #ddd); border:1px solid var(--SmartThemeBorderColor, #555); border-radius:4px; padding:6px; font-family:inherit;">
+                        <option value="after">末尾 (推荐，注意力权重最高)</option>
+                        <option value="before">开头 (前置提示词区)</option>
+                        <option value="system">系统指令区 (深度嵌入)</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 15px; width: 100%;">
+                    <label style="display:block; margin-bottom:5px; color:var(--SmartThemeBodyColor); font-size:13px;">独立输出强制提醒提示词：</label>
+                    <textarea id="ca-statusBarPrompt" rows="4" style="width:100%; background:var(--SmartThemeControlColor, #222); color:var(--SmartThemeBodyColor, #ddd); border:1px solid var(--SmartThemeBorderColor, #555); border-radius:4px; padding:8px; resize:vertical; font-family:inherit;"></textarea>
+                </div>
+            `);
+        }
+
         window.ConsistencyAnchor.loadSettingsToUI();
 
-        $('#anchor-content-area input').off('change.caSettings').on('change.caSettings', () => {
+        // ★★★ 优化保存逻辑：针对 input 和 select 立即保存，针对 textarea 离开时防抖保存 ★★★
+        $('#anchor-content-area').off('change.caSettings', 'input, select').on('change.caSettings', 'input, select', () => {
+            window.ConsistencyAnchor.saveSettings();
+        });
+        $('#anchor-content-area').off('blur.caSettings', 'textarea').on('blur.caSettings', 'textarea', () => {
             window.ConsistencyAnchor.saveSettings();
         });
 
-        $('#anchor-content-area button').each(function() {
+        // ★★★ 采用事件委托：防止多次打开面板叠加 click 事件导致卡顿 ★★★
+        $('#anchor-content-area').off('click.caSave', 'button').on('click.caSave', 'button', function() {
             if ($(this).text().includes('保存')) {
-                $(this).css('cursor', 'pointer').off('click.caSave').on('click.caSave', function() {
-                    window.ConsistencyAnchor.saveSettings();
-                    const btn = $(this);
-                    const originalText = btn.text();
-                    const originalBg = btn.css('background-color');
-                    btn.text('✓ 已保存').css('background-color', '#4caf50');
-                    setTimeout(() => btn.text(originalText).css('background-color', originalBg), 1500);
-                });
+                window.ConsistencyAnchor.saveSettings();
+                const btn = $(this);
+                const originalText = btn.text();
+                const originalBg = btn.css('background-color');
+                btn.text('✓ 已保存').css('background-color', '#4caf50');
+                setTimeout(() => btn.text(originalText).css('background-color', originalBg), 1500);
             }
         });
     },
@@ -647,9 +752,8 @@ const UIManager = {
         try {
             const response = await fetch(`${extensionPath}/anchor.html`);
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            this.htmlCache = await response.text(); 
+            this.htmlCache = await response.text();
             $('#anchor-content-area').html(this.htmlCache);
-            
             this.bindFormEvents();
             console.log('[ConsistencyAnchor] UI 加载完成，已缓存');
         } catch (e) {
@@ -673,7 +777,6 @@ let initIntervalTimer = setInterval(async () => {
     if (window.SillyTavern && window.SillyTavern.getContext && hasJQuery) {
         clearInterval(initIntervalTimer);
         
-        // ★★★ 多路径检测（兼容老旧浏览器）★★★
         try {
             if (typeof import.meta !== 'undefined' && import.meta.url) {
                 extensionPath = new URL(import.meta.url).pathname.replace(/\/index\.js.*$/, '');
@@ -689,20 +792,18 @@ let initIntervalTimer = setInterval(async () => {
                 }
             }
             
-            // 备用方案：当所有现代 API 都无法获取路径时
             if (!extensionPath) {
                 console.warn('[ConsistencyAnchor] 无法自动解析路径，尝试 ST 1.13 标准后备路径');
                 extensionPath = '../../data/default-user/extensions/consistency_anchor';
             }
         } catch (e) {
             console.warn('[ConsistencyAnchor] 路径检测引发异常，使用兜底路径', e);
-            extensionPath = '../../data/default-user/extensions/consistency_anchor'; 
+            extensionPath = '../../data/default-user/extensions/consistency_anchor';
         }
 
         console.log('[ConsistencyAnchor] 正在启动...');
         
         await window.ConsistencyAnchor.init();
-        
         UIManager.injectCSS();
         UIManager.injectPanelAndFloatBtn();
         UIManager.injectMenuButton();
