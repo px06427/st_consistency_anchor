@@ -35,10 +35,11 @@ https://github.com/px06427/st_consistency_anchor
 
 ### 方式二：手动下载
 
-1. 从 [Releases]https://github.com/px06427/st_consistency_anchor/releases) 下载最新版本的 ZIP 包。
-2. 解压到 `SillyTavern/plugins/` 目录下（确保文件夹名为 `chat-log-manager`）。
-3. 重启 SillyTavern 或刷新页面。
-
+1. 从https://github.com/px06427/st_consistency_anchor)中下载最新版本的 ZIP 包。
+2. 点击绿色的 **“Code”** 按钮，选择 **“Download ZIP”**。
+3. 解压 ZIP 包，将解压后的文件夹重命名为 `chat-log-manager`（如果已命名则跳过）。
+4. 将整个文件夹放入 SillyTavern 的 `plugins/` 目录中。
+5. 重启 SillyTavern 或刷新页面。
 ---
 
 ## 📖 使用说明
