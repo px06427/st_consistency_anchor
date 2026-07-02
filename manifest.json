@@ -1,0 +1,12 @@
+{
+    "display_name": "Chat Log Manager",
+    "name": "chat-log-manager",
+    "loading_order": 1,
+    "js": "index.js",
+    "css": "style.css",
+    "author": "ganlu",
+    "version": "1.0.0",
+    "homePage": "https://github.com/px06427/st_consistency_anchor",
+    "auto_update": true,
+    "minimum_client_version": "1.0.0"
+}
